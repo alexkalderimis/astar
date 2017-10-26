@@ -1,39 +1,122 @@
-module Data.Graph.AStar (aStar,aStarM) where
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances
+           , AllowAmbiguousTypes
+           , ScopedTypeVariables
+           #-}
+module Data.Graph.AStar (aStar, aStarOrd, aStarM) where
 
-import qualified Data.HashSet as Set
-import Data.HashSet (HashSet)
-import Data.Hashable (Hashable(..))
-import qualified Data.HashMap.Strict as Map
-import Data.HashMap.Strict (HashMap, (!))
-import qualified Data.OrdPSQ as PSQ
-import Data.OrdPSQ (OrdPSQ, minView)
-import Data.List (foldl')
-import Control.Monad (foldM)
+import           Prelude hiding (lookup)
 
-data AStar a c = AStar { visited  :: !(HashSet a),
-                         waiting  :: !(OrdPSQ a c ()),
-                         score    :: !(HashMap a c),
-                         memoHeur :: !(HashMap a c),
-                         cameFrom :: !(HashMap a a),
-                         end      :: !(Maybe a) }
-    deriving Show
+import           Control.Monad (foldM)
+import           Data.Foldable (toList, foldl')
 
-aStarInit start = AStar { visited  = Set.empty,
-                          waiting  = PSQ.singleton start 0 (),
-                          score    = Map.singleton start 0,
-                          memoHeur = Map.empty,
-                          cameFrom = Map.empty,
-                          end      = Nothing }
+-- hashable types
+import           Data.Hashable (Hashable(..))
+import qualified Data.HashSet as HS
+import           Data.HashSet (HashSet)
+import qualified Data.HashMap.Strict as HM
+import           Data.HashMap.Strict (HashMap)
+import qualified Data.HashPSQ as HPQ
+import           Data.HashPSQ (HashPSQ)
+
+-- ord types
+import qualified Data.Map.Strict as M
+import qualified Data.Set as S
+import qualified Data.OrdPSQ as OPQ
+import           Data.OrdPSQ (OrdPSQ)
+
+
+-- we need generic maps, queues and sets, supporting a small subset
+-- of their usual interfaces:
+
+class GMap map k where
+    insert :: k -> v -> map k v -> map k v
+    get :: map k v -> k -> v
+    fromList :: [(k, v)] -> map k v
+
+class GQueue q k p where
+    singleton :: k -> p -> q k p ()
+    minView :: q k p () -> Maybe (k, p, (), q k p ())
+    lookup :: k -> q k p v -> Maybe (p, v)
+    enqueue :: k -> p -> q k p () -> q k p ()
+
+class (Foldable s, Monoid (s a)) => GSet s a where
+    add :: a -> s a -> s a
+    difference :: s a -> s a -> s a
+
+-- for Hashable keys, we can use HashMap, HashPSQ and HashSet
+
+instance (Hashable k, Eq k) => GMap HashMap k where
+    insert = HM.insert
+    get = (HM.!)
+    fromList = HM.fromList
+
+instance (Hashable k, Ord k, Ord p) => GQueue HashPSQ k p where
+    singleton k p = HPQ.singleton k p ()
+    minView = HPQ.minView
+    lookup = HPQ.lookup
+    enqueue k p = HPQ.insert k p ()
+
+instance (Hashable a, Eq a) => GSet HashSet a where
+    add = HS.insert
+    difference = HS.difference
+
+-- for Ord keys, we use Data.Map.Strict.Map, OrdPSQ and Data.Set.Set
+
+instance (Eq k, Ord k) => GMap M.Map k where
+    insert = M.insert
+    get = (M.!)
+    fromList = M.fromList
+
+instance (Ord k, Ord p) => GQueue OrdPSQ k p where
+    singleton k p = OPQ.singleton k p ()
+    minView = OPQ.minView
+    lookup = OPQ.lookup
+    enqueue k p = OPQ.insert k p ()
+
+instance (Ord a) => GSet S.Set a where
+    add = S.insert
+    difference = S.difference
+
+data AStar s q m a c = AStar
+    { visited  :: !(s a) 
+    , waiting  :: !(q a c ())
+    , score    :: !(m a c)
+    , memoHeur :: !(m a c)
+    , cameFrom :: !(m a a)
+    , end      :: !(Maybe a)
+    }
+
+aStarInit :: (Num c, GSet s a, GMap m a , GQueue q a c)
+          => a -> AStar s q m a c
+aStarInit start = AStar { visited  = mempty
+                        , waiting  = singleton start 0
+                        , score    = fromList [(start, 0)]
+                        , memoHeur = fromList []
+                        , cameFrom = fromList []
+                        , end      = Nothing
+                        }
 
 runAStar :: (Hashable a, Ord a, Ord c, Num c)
-         => (a -> HashSet a)     -- adjacencies in graph
-         -> (a -> a -> c) -- distance function
-         -> (a -> c)      -- heuristic distance to goal
-         -> (a -> Bool)   -- goal
-         -> a             -- starting vertex
-         -> AStar a c     -- final state
+         => (a -> HashSet a) -- adjacencies in graph
+         -> (a -> a -> c)    -- distance function
+         -> (a -> c)         -- heuristic distance to goal
+         -> (a -> Bool)      -- goal
+         -> a                -- starting vertex
+         -> AStar HashSet HashPSQ HashMap a c -- final state
 
-runAStar graph dist heur goal start = aStar' (aStarInit start)
+runAStar graph dist heur goal = runAStarG graph dist heur goal . aStarInit
+
+runAStarG :: (Num c, Ord a, Ord c, GSet s a, GMap m a, GQueue q a c)
+          => (a -> s a)     -- adjacencies in graph
+         -> (a -> a -> c)   -- distance function
+         -> (a -> c)        -- heuristic distance to goal
+         -> (a -> Bool)     -- goal
+         -> AStar s q m a c -- initial state
+         -> AStar s q m a c -- final state
+
+runAStarG successors dist heur goal starting = aStar' starting
   where aStar' s
           = case minView (waiting s) of
               Nothing            -> s
@@ -42,21 +125,23 @@ runAStar graph dist heur goal start = aStar' (aStarInit start)
                   then s { end = Just x }
                   else aStar' $ foldl' (expand x)
                                        (s { waiting = w',
-                                            visited = Set.insert x (visited s)})
-                                       (Set.toList (graph x `Set.difference` visited s))
+                                            visited = add x (visited s)})
+                                       (successors x `difference` visited s)
         expand x s y
-          = let v = score s ! x + dist x y
-            in case PSQ.lookup y (waiting s) of
+          = let v = (score s `get` x) + dist x y
+            in case lookup y (waiting s) of
                  Nothing -> link x y v
                               (s { memoHeur
-                                     = Map.insert y (heur y) (memoHeur s) })
-                 Just _  -> if v < score s ! y
+                                     = insert y (heur y) (memoHeur s) })
+                 Just _  -> if v < (score s `get` y)
                               then link x y v s
                               else s
         link x y v s
-           = s { cameFrom = Map.insert y x (cameFrom s),
-                 score    = Map.insert y v (score s),
-                 waiting  = PSQ.insert y (v + memoHeur s ! y) () (waiting s) }
+          = let h = v + (memoHeur s `get` y)
+            in s { cameFrom = insert  y x (cameFrom s)
+                 , score    = insert  y v (score s)
+                 , waiting  = enqueue y h (waiting s)
+                 }
 
 -- | This function computes an optimal (minimal distance) path through a graph in a best-first fashion,
 -- starting from a given starting point.
@@ -72,20 +157,17 @@ aStar :: (Hashable a, Ord a, Ord c, Num c) =>
          -> a             -- ^ The vertex to start searching from.
          -> Maybe [a]     -- ^ An optimal path, if any path exists. This excludes the starting vertex.
 aStar graph dist heur goal start
-    = let s = runAStar graph dist heur goal start
-      in case end s of
-            Nothing -> Nothing
-            Just e  -> Just (reverse . takeWhile (not . (== start)) . iterate (cameFrom s !) $ e)
+  = unwindState start $ runAStar graph dist heur goal start
 
-runAStarM :: (Monad m, Hashable a, Ord a, Ord c, Num c) =>
+runAStarM :: forall a c m. (Monad m, Hashable a, Ord a, Ord c, Num c) =>
           (a -> m (HashSet a))   -- adjacencies in graph
           -> (a -> a -> m c) -- distance function
           -> (a -> m c)      -- heuristic distance to goal
           -> (a -> m Bool)   -- goal
           -> a               -- starting vertex
-          -> m (AStar a c)   -- final state
+          -> m (AStar HashSet HashPSQ HashMap a c)   -- final state
 
-runAStarM graph dist heur goal start = aStar' (aStarInit start)
+runAStarM graph dist heur goal start = aStar' (aStarInit start :: AStar HashSet HashPSQ HM.HashMap a c)
   where aStar' s
           = case minView (waiting s) of
               Nothing            -> return s
@@ -95,22 +177,22 @@ runAStarM graph dist heur goal start = aStar' (aStarInit start)
                         else do ns <- graph x
                                 u <- foldM (expand x)
                                            (s { waiting = w',
-                                                visited = Set.insert x (visited s)})
-                                           (Set.toList (ns `Set.difference` visited s))
+                                                visited = add x (visited s)})
+                                           (toList (ns `difference` visited s))
                                 aStar' u
         expand x s y
           = do d <- dist x y
-               let v = score s ! x + d
-               case PSQ.lookup y (waiting s) of
+               let v = (score s `get` x) + d
+               case lookup y (waiting s) of
                  Nothing -> do h <- heur y
-                               return (link x y v (s { memoHeur = Map.insert y h (memoHeur s) }))
-                 Just _  -> return $ if v < score s ! y
+                               return (link x y v (s { memoHeur = insert y h (memoHeur s) }))
+                 Just _  -> return $ if v < score s `get` y
                                         then link x y v s
                                         else s
         link x y v s
-           = s { cameFrom = Map.insert y x (cameFrom s),
-                 score    = Map.insert y v (score s),
-                 waiting  = PSQ.insert y (v + memoHeur s ! y) () (waiting s) }
+           = s { cameFrom = insert y x (cameFrom s),
+                 score    = insert y v (score s),
+                 waiting  = enqueue y (v + (memoHeur s `get` y)) (waiting s) }
 
 -- | This function computes an optimal (minimal distance) path through a graph in a best-first fashion,
 -- starting from a given starting point.
@@ -128,21 +210,31 @@ aStarM :: (Monad m, Hashable a, Ord a, Ord c, Num c) =>
 aStarM graph dist heur goal start
     = do sv <- start
          s <- runAStarM graph dist heur goal sv
-         return $ case end s of
-                    Nothing -> Nothing
-                    Just e  -> Just (reverse . takeWhile (not . (== sv)) . iterate (cameFrom s !) $ e)
+         return $ unwindState sv s
 
+-- | This function computes an optimal (minimal distance) path through a graph in a best-first fashion,
+-- starting from a given starting point.
+-- This function accepts non-Hashable items
+aStarOrd :: forall a c. (Ord a, Ord c, Num c) =>
+         (a -> S.Set a)     -- ^ The graph we are searching through, given as a function from vertices
+                          -- to their neighbours.
+         -> (a -> a -> c) -- ^ Distance function between neighbouring vertices of the graph. This will
+                          -- never be applied to vertices that are not neighbours, so may be undefined
+                          -- on pairs that are not neighbours in the graph.
+         -> (a -> c)      -- ^ Heuristic distance to the (nearest) goal. This should never overestimate the
+                          -- distance, or else the path found may not be minimal.
+         -> (a -> Bool)   -- ^ The goal, specified as a boolean predicate on vertices.
+         -> a             -- ^ The vertex to start searching from.
+         -> Maybe [a]     -- ^ An optimal path, if any path exists. This excludes the starting vertex.
+aStarOrd graph dist heur goal start
+  = unwindState start
+  . runAStarG graph dist heur goal
+  $ (aStarInit start :: AStar S.Set OrdPSQ M.Map a c)
 
+unwindState :: (GMap m a, Eq a) => a -> AStar s q m a c -> Maybe [a]
+unwindState start s = unwind (cameFrom s) start <$> end s
 
-
-plane :: (Integer, Integer) -> HashSet (Integer, Integer)
-plane (x,y) = Set.fromList [(x-1,y),(x+1,y),(x,y-1),(x,y+1)]
-
-planeHole :: (Integer, Integer) -> HashSet (Integer, Integer)
-planeHole (x,y) = Set.filter (\(u,v) -> planeDist (u,v) (0,0) > 10) (plane (x,y))
-
-planeDist :: (Integer, Integer) -> (Integer, Integer) -> Double
-planeDist (x1,y1) (x2,y2) = sqrt ((x1'-x2')^2 + (y1'-y2')^2)
-    where [x1',y1',x2',y2'] = map fromInteger [x1,y1,x2,y2]
-
-
+unwind :: (GMap m a, Eq a) => m a a -> a -> a -> [a]
+unwind history start = reverse
+                     . takeWhile (/= start)
+                     . iterate (history `get`)
